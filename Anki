@@ -1,0 +1,764 @@
+<style>
+  .wrap{min-height:85vh;display:flex;align-items:center;justify-content:center}
+  .panel{max-width:980px;width:100%;text-align:center;padding:24px}
+  .front{font-size:1.4rem;opacity:.9;margin-bottom:6px}
+  .gold{font-size:1.6rem;margin:8px 0 14px}
+  #vis{margin-top:12px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+  #vis span{font-size:1.25rem;padding:8px 12px;border-radius:12px}
+  #bar{height:28px;background:#2a2a2a;border-radius:14px;margin:12px 0;overflow:hidden}
+  #summary,#classStats{margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:10px;justify-items:center}
+  #summary>div,#classStats>div{width:100%;max-width:460px;border-radius:12px;padding:10px 12px;font-size:1.05rem}
+  #summary>div:nth-child(1){background:#0c2;color:#fff}
+  #summary>div:nth-child(2){background:#06a;color:#fff}
+  #summary>div:nth-child(3){background:#a60;color:#fff}
+  #summary>div:nth-child(4){background:#048;color:#fff}
+  #classStats>div{background:#1b1b1b;color:#ddd}
+  #log{white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;background:#101010;color:#81f581;padding:10px;border-radius:12px;margin-top:12px;text-align:left;font-size:.95rem}
+  #rec{font-weight:700;margin-top:14px;font-size:1.35rem}
+  .badge{padding:6px 14px;border-radius:999px;border:2px solid currentColor;display:inline-block}
+  #classStats { display: none !important; }
+</style>
+
+<div class="wrap">
+  <div class="panel">
+    <div class="front">{{Front}}</div>
+    <div class="gold">✅ Эталон: <span id="target">{{Back}}</span></div>
+
+    <input id="answer" type="hidden" />
+
+    <div id="vis"></div>
+    <div id="bar"></div>
+
+    <div id="summary"></div>
+    <div id="classStats"></div>
+
+    <div id="rec"></div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+// ========== CONFIG (v3.17.0-logging) ==========
+const CFG = {
+  VERSION: "v3.17.0-logging",
+  weights: { A:1.0, B:0.6, C:0.2, SHORT:0.6 },
+
+  penalty: {
+    extraPerWord:0.3, extraCapToken:0.6, extraCapPhrase:0.25,
+    orderA:0.2, orderCap:0.15,
+    hintMaxFrac: 0.20,
+    hintCurve: { type: "sigmoid", k: 12, x0: 0.45 }
+  },
+  hysteresis: { hard:68, again:72 },
+
+  // ==== словари / наборы ====
+  shortSet: new Set(["to","of","in","at","on","by","as","if","or","so","up"]),
+  criticalA: new Set(["not","never"]),
+  auxCritical: { mode: "contextual" }, // "all" | "contextual" | "off"
+  temporalA: new Set(["today","tomorrow","yesterday","tonight","noon","midnight"])
+};
+
+// ---- многословные фразы (B и C) ----
+const PHRASES_B_RAW = [
+  "according to","ahead of","apart from","as for","as of","as per","as to","as with",
+  "aside from","back of","because of","by means of","by way of","close to",
+  "contrary to","due to","except for","far from","in addition to","in case of","in charge of",
+  "in favor of","in favour of","in front of","in lieu of","in place of","in spite of",
+  "in view of","inside of","instead of","near to","next to","on account of","on behalf of","on top of",
+  "out of","outside of","owing to","prior to","pursuant to","subsequent to","thanks to","together with",
+  "up to","up against","with respect to","with regard to","with reference to","in accordance with",
+  "in relation to","in line with","in connection with","in response to","in terms of",
+  "with a view to","with the exception of","in the face of","by virtue of","on the basis of",
+  "as opposed to","in contrast to","on the part of","in light of",
+  "as well as","rather than","as much as","no less than","no more than",
+  "used to","ought to","had better","would rather","would sooner","so as to","in order to"
+];
+const PHRASES_C_RAW = [
+  "kind of","sort of","a bit","a little","a little bit","in fact","of course","by the way",
+  "after all","at least","at most","for sure","for real","in general","in particular",
+  "on the other hand","on the one hand","to be honest","to be fair","to be frank",
+  "you know","i mean","as a matter of fact","in other words","more or less",
+  "to some extent","to a certain extent","at all","no doubt","as for me","as for you"
+];
+const PHRASES_B = new Set(PHRASES_B_RAW.map(p=>p.replace(/\s+/g,"_")));
+const PHRASES_C = new Set(PHRASES_C_RAW.map(p=>p.replace(/\s+/g,"_")));
+CFG.phrasesB = PHRASES_B;
+CFG.phrasesC = PHRASES_C;
+
+// ---- закрытые классы (B) ----
+const CLOSED_B = {
+  PRON: new Set([
+    "i","you","he","she","it","we","they","me","him","her","us","them",
+    "my","your","his","her","its","our","their","mine","yours","hers","ours","theirs",
+    "myself","yourself","himself","herself","itself","ourselves","yourselves","themselves",
+    "this","that","these","those","who","whom","whose","which","what","whoever","whomever","whichever","whatever",
+    "each","either","neither","none","one","ones","other","others","another",
+    "someone","somebody","something","anyone","anybody","anything","everyone","everybody","everything",
+    "noone","nobody","nothing"
+  ]),
+  AUX: new Set(["be","am","is","are","was","were","been","being","do","does","did","have","has","had"]),
+  MODAL: new Set(["will","shall","can","could","may","might","must","would","should","ought","need","dare"]),
+  PREP: new Set([
+    "to","of","in","on","at","for","from","with","about","into","after","over","between","without","under","within",
+    "through","during","before","by","as","like","than","since","until","till","above","across","against","along",
+    "amid","among","around","behind","below","beneath","beside","besides","beyond","concerning","despite","down",
+    "except","excluding","following","inside","outside","near","off","onto","opposite","past","per","regarding",
+    "round","save","throughout","toward","towards","underneath","unlike","upon","versus","via","within","without","worth"
+  ]),
+  CONJ: new Set([
+    "and","or","but","so","for","nor","yet",
+    "although","though","because","since","while","whereas","whether","unless",
+    "once","when","whenever","where","wherever","how","that","if","as"
+  ])
+};
+CFG.closedB = CLOSED_B;
+
+// ---- мягкие модификаторы/филлеры (C) ----
+const SOFT_C = new Set([
+  "a","an","the","please","ok","okay",
+  "just","really","very","quite","pretty","well","maybe","perhaps","actually",
+  "simply","only","still","even","almost","nearly","mostly","largely",
+  "basically","essentially","literally","virtually","technically","practically",
+  "frankly","honestly","seriously","clearly","obviously","surely","certainly","indeed",
+  "definitely","absolutely","totally","completely","entirely","highly","deeply",
+  "strongly","extremely","fairly","slightly","somewhat","rather","particularly",
+  "especially","exactly","roughly","approximately","around","possibly","probably",
+  "arguably","allegedly","apparently","typically","usually","generally","normally",
+  "anyway","anyways","however","moreover","furthermore","nevertheless","nonetheless",
+  "therefore","thus","hence","consequently","meanwhile","meantime","besides",
+  "truly","sure","kinda","sorta","super","ultra","mega","literally",
+  "already","soon","later","nowadays","afterwards","beforehand","eventually","ultimately",
+  "well","oh","ah","uh","um","hmm"
+]);
+CFG.softC = SOFT_C;
+
+// ---- -ly исключения ----
+const LY_EXCEPTIONS = new Set([
+  "only","family","ally","italy","sicily","chile","reply","supply","apply","multiply","imply","comply","rely",
+  "sly","ugly","holy","jolly","silly","early","hourly","daily","weekly","monthly","yearly",
+  "friendly","lovely","lively","elderly","costly","ghostly","scholarly","cowardly","motherly","fatherly",
+  "manly","womanly","kingly","saintly","timely","homely","comely","wobbly","sparkly","burly","curly"
+]);
+CFG.lyExceptions = LY_EXCEPTIONS;
+
+// ---- числа/даты/дни/месяцы/числительные → A ----
+const MONTHS = new Set(["january","february","march","april","may","june","july","august","september","october","november","december","jan","feb","mar","apr","jun","jul","aug","sep","sept","oct","nov","dec"]);
+const WEEKDAYS = new Set(["monday","tuesday","wednesday","thursday","friday","saturday","sunday","mon","tue","tues","wed","thu","thur","thurs","fri","sat","sun"]);
+const NUMBER_WORDS = new Set([
+  "zero","one","two","three","four","five","six","seven","eight","nine","ten",
+  "eleven","twelve","thirteen","fourteen","fifteen","sixteen","seventeen","eighteen","nineteen",
+  "twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety",
+  "hundred","thousand","million","billion","trillion",
+  "first","second","third","fourth","fifth","sixth","seventh","eighth","ninth","tenth",
+  "eleventh","twelfth","thirteenth","fourteenth","fifteenth","sixteenth","seventeenth","eighteenth","nineteenth",
+  "twentieth","thirtieth","fortieth","fiftieth","sixtieth","seventieth","eightieth","ninetieth",
+  "hundredth","thousandth","millionth","billionth","trillionth"
+]);
+
+// ===== A-phrasals core sets =====
+if(!window.PHRASES_A2)      window.PHRASES_A2      = new Set(); // "turn_off"
+if(!window.PHRASES_A3)      window.PHRASES_A3      = new Set(); // "look_forward_to"
+if(!window.SEPARABLE_A2)    window.SEPARABLE_A2    = new Set(); // "write_down" (разделяемые)
+function isPhrasalAKey(key){
+  return (window.PHRASES_A2 && window.PHRASES_A2.has(key)) || (window.PHRASES_A3 && window.PHRASES_A3.has(key));
+}
+
+// ========= helpers =========
+function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+// --- B/C фразы + A-фразалы (склейка в "_") ---
+let __A2_RE=null, __A3_RE=null;
+function __buildPhrasalRegex(){
+  if(__A2_RE && __A3_RE) return;
+  const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  __A2_RE = [...window.PHRASES_A2].map(k=>{
+    const [v,p] = k.split("_");
+    return { k, re: new RegExp(`\\b${esc(v)}(?:s|es|ed|ing)?\\s+${esc(p)}\\b`, "gi") };
+  });
+  __A3_RE = [...window.PHRASES_A3].map(k=>{
+    const [v,m,pr] = k.split("_");
+    return { k, re: new RegExp(`\\b${esc(v)}(?:s|es|ed|ing)?\\s+${esc(m)}\\s+${esc(pr)}\\b`, "gi") };
+  });
+}
+function preCollapsePhrases(s){
+  // B/C
+  const all = [...PHRASES_B_RAW, ...PHRASES_C_RAW, "each other","one another"];
+  all.forEach(p=>{
+    const re = new RegExp("\\b"+p.replace(/\s+/g,"\\s+")+"\\b","gi");
+    s = s.replace(re, p.replace(/\s+/g,"_"));
+  });
+  // A (после того как PHRASES_A2/A3 будут наполнены статическим блоком)
+  __buildPhrasalRegex();
+  if(__A3_RE) __A3_RE.forEach(({k,re})=>{ s = s.replace(re, k); });
+  if(__A2_RE) __A2_RE.forEach(({k,re})=>{ s = s.replace(re, k); });
+  return s;
+}
+
+// --- эвристики форм глаголов ---
+const IRREG_V3 = new Set([
+  "been","had","done","gone","come","become","overcome",
+  "abided","abode","arisen","awoken","awakened","backslid","backslidden","become",
+  "befallen","begotten","gotten","got","beheld","beaten","beat","begun","bent","beset",
+  "bet","betted","bidden","bid","bound","bitten","bit","bled","blown","broken","bred",
+  "brought","broadcast","broadcasted","built","burnt","burned","burst","bought",
+  "cast","caught","chosen","clad","clothed","cleft","cloven","come","cost","crept","cut",
+  "dealt","dug","dived","dove","done","drawn","dreamt","dreamed","driven","drunk","drank",
+  "dwelled","dwelt",
+  "eaten","fallen","fed","felt","fought","found","fit","fitted","fled","flung","flown",
+  "forbidden","forecast","forecasted","forgotten","forgot","forgiven","forgone","forsaken",
+  "frozen","gilt","gilded","girt","girded","given","ground","grown",
+  "hanged","hung","heard","hewn","hewed","hidden","hit","held","hurt","kept","knelt",
+  "kneeled","knit","knitted","known",
+  "laid","led","leant","leaned","leapt","leaped","left","lent","let","lain","lit","lighted",
+  "lost","made","meant","met","mown","mowed",
+  "paid","proved","proven","put",
+  "quit","quitted","read","ridden","rung","risen","run",
+  "sawn","sawed","said","seen","sought","sold","sent","set","sewn","sewed","shaken","shaved",
+  "shaven","shorn","sheared","shed","shone","shined","shot","shown","showed","shut","sung",
+  "sank","sunk","sunken","sat","slept","slain","slid","slidden","slinged","slung","slit",
+  "smelt","smelled","smitten","smote","sown","sowed","spoken","sped","speeded","spent",
+  "spilt","spilled","spun","spat","spit","split","spoilt","spoiled","spread","sprung",
+  "stood","stolen","stuck","stung","stunk","stank","stridden","struck","stricken","strung",
+  "striven","sworn","swept","swollen","swelled","swum","swung",
+  "taken","taught","torn","told","thought","thrown","thrust","trodden","trod","understood",
+  "undone","upset","woken","waked","worn","woven","wed","wedded","wept","won","wound",
+  "withdrawn","withheld","withstood","wrung","written"
+]);
+function looksGerund(w){ return /^[a-z]+ing$/.test(w); }
+function looksV3(w){
+  if (!w) return false;
+  if (IRREG_V3.has(w)) return true;
+  return /^[a-z]+(ed|en)$/.test(w);
+}
+
+// --- раскрытие сокращений перед чисткой ---
+function expandContractions(s){
+  s = s.replace(/\b(can|could|should|would|must)n['’]t\b/gi, "$1 not");
+  s = s.replace(/\b(don|doesn|didn)['’]t\b/gi, (m,p)=> p==="don"?"do not":p==="doesn"?"does not":"did not");
+  s = s.replace(/\b(I|you|he|she|it|we|they)['’]ll\b/gi, "$1 will");
+  s = s.replace(/\b(I|you|he|she|it|we|they)['’]ve\b/gi, "$1 have");
+  s = s.replace(/\b(I|you|he|she|it|we|they)['’]re\b/gi, "$1 are");
+  s = s.replace(/\bI['’]m\b/gi, "I am");
+  s = s.replace(/\b(he|she|it|who|that|there|what|where|here)['’]s\s+([A-Za-z]+)/gi,
+    (m,sub,next)=> looksV3(next.toLowerCase()) ? `${sub} has ${next}` : `${sub} is ${next}`);
+  return s;
+}
+
+function normalize(s){
+  s = s.normalize('NFC').toLowerCase();
+  s = expandContractions(s);
+  s = preCollapsePhrases(s);                // ⬅️ B/C + A-фразалы
+  s = s.replace(/['\u2018\u2019\u02BC\u0060\u00B4\u2032\u02B9\uFF07]/g,"");
+  s = s.replace(/[\u201C\u201D]/g,'"');
+  s = s.replace(/[.,!?;:"«»(){}\[\]—–\-\/\\]/g,' '); // ← подчёркивание НЕ трогаем
+  s = s.replace(/\s+/g,' ').trim();
+  return s;
+}
+function tokenize(s){ return normalize(s).split(/\s+/).filter(Boolean); }
+
+// — лемма головы фразала и свёртка разделяемых пар —
+const __IRREG_BASE = { went:"go", gone:"go", did:"do", done:"do", saw:"see", seen:"see", took:"take", taken:"take",
+  made:"make", gave:"give", given:"give", got:"get", gotten:"get", wrote:"write", written:"write", brought:"bring",
+  bought:"buy", came:"come", ran:"run", taught:"teach", told:"tell", thought:"think", kept:"keep", left:"leave",
+  found:"find", felt:"feel", held:"hold", paid:"pay", read:"read", led:"lead", sat:"sit", slept:"sleep",
+  spoke:"speak", spoken:"speak", tore:"tear", torn:"tear", wore:"wear", worn:"wear" };
+function lemmaBase(w){
+  let t=w.toLowerCase();
+  if(__IRREG_BASE[t]) return __IRREG_BASE[t];
+  if(/ing$/.test(t)){ t=t.replace(/ing$/,''); if(/(.)\1$/.test(t)) t=t.slice(0,-1); }
+  else if(/ed$/.test(t)){ t=t.replace(/ed$/,''); if(/(.)\1$/.test(t)) t=t.slice(0,-1); }
+  else if(/(es|s)$/.test(t)){ t=t.replace(/(es|s)$/,''); }
+  return t;
+}
+// write … down → write_down (окно 4 токена)
+function collapseSeparableA2(tokens){
+  const win=4;
+  for(let i=0;i<tokens.length;i++){
+    const vbase = lemmaBase(tokens[i]);
+    for(let j=i+1;j<Math.min(tokens.length, i+1+win); j++){
+      const p = tokens[j];
+      const key = `${vbase}_${p}`;
+      if(window.SEPARABLE_A2.has(key)){
+        tokens[i] = key;
+        tokens.splice(j,1);
+        i = Math.max(-1, i-2);
+        break;
+      }
+    }
+  }
+  return tokens;
+}
+
+function isNumberLike(tok){
+  return /^(\d{1,3}(,\d{3})*|\d+)(\.\d+)?$/.test(tok) || /^(\d{1,2}(:\d{2}){1,2})$/.test(tok) || /^\d+(st|nd|rd|th)$/.test(tok);
+}
+function isDateLike(tok){
+  return MONTHS.has(tok) || WEEKDAYS.has(tok) || /^\d{4}$/.test(tok) || /^\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?$/.test(tok);
+}
+function isClosedClassB(tok){
+  const C = CFG.closedB;
+  return C.PRON.has(tok) || C.AUX.has(tok) || C.MODAL.has(tok) || C.PREP.has(tok) || C.CONJ.has(tok);
+}
+function isSoftC(tok){
+  if (CFG.softC.has(tok)) return true;
+  if (tok.endsWith("ly") && !CFG.lyExceptions.has(tok)) return true;
+  return false;
+}
+function isShort(tok){ return CFG.shortSet.has(tok); }
+
+// ---- базовый (на всякий случай) ----
+function classify(tok){
+  if (tok.includes("_")){
+    if (isPhrasalAKey(tok)) return "A";
+    if (CFG.phrasesB.has(tok)) return "B";
+    if (CFG.phrasesC.has(tok)) return "C";
+    const parts = tok.split("_");
+    if (parts.every(p => isClosedClassB(p) || isShort(p))) return "B";
+  }
+  if (CFG.criticalA.has(tok)) return "A";
+  if (CFG.temporalA.has(tok)) return "A";
+  if (isNumberLike(tok) || isDateLike(tok) || NUMBER_WORDS.has(tok)) return "A";
+  if (isClosedClassB(tok)) return "B";
+  if (isSoftC(tok)) return "C";
+  if (isShort(tok)) return "SHORT";
+  return "A";
+}
+
+// ---- контекстный классификатор (AUX → критикал по mode) ----
+function classifyCtx(tokens, i){
+  const tok  = tokens[i];
+  const next = tokens[i+1] || "";
+
+  // фразы A/B/C
+  if (tok.includes("_")){
+    if (isPhrasalAKey(tok)) return "A";
+    if (CFG.phrasesB.has(tok)) return "B";
+    if (CFG.phrasesC.has(tok)) return "C";
+    const parts = tok.split("_");
+    if (parts.every(p => isClosedClassB(p) || isShort(p))) return "B";
+  }
+
+  if (CFG.criticalA.has(tok)) return "A";
+
+  if (CFG.closedB.AUX.has(tok)) {
+    const mode = (CFG.auxCritical && CFG.auxCritical.mode) || "all";
+    if (mode === "all") return "A";
+    if (mode === "contextual") {
+      if (["be","am","is","are","was","were","been","being"].includes(tok)) {
+        if (looksGerund(next) || looksV3(next)) return "A";
+        return "B"; // копула
+      }
+      if (["have","has","had"].includes(tok)) {
+        if (looksV3(next)) return "A";
+        return "A"; // лексическое have
+      }
+      if (["do","does","did"].includes(tok)) {
+        if (next==="not") return "A";
+        if (!isClosedClassB(next) && !isSoftC(next) && !isShort(next) &&
+            !/^[a-z]+(ed|ing|s)$/.test(next)) return "A";
+        return "A"; // лексическое do
+      }
+    }
+  }
+
+  if (CFG.temporalA.has(tok) || isNumberLike(tok) || isDateLike(tok) || NUMBER_WORDS.has(tok)) return "A";
+  if (isClosedClassB(tok)) return "B";
+  if (isSoftC(tok)) return "C";
+  if (isShort(tok)) return "SHORT";
+  return "A";
+}
+
+function weight(cls){ return CFG.weights[cls] || 1.0; }
+
+// расстояния
+function levenshtein(a,b){
+  const dp=Array(a.length+1).fill().map(()=>Array(b.length+1).fill(0));
+  for(let i=0;i<=a.length;i++)dp[i][0]=i;
+  for(let j=0;j<=b.length;j++)dp[0][j]=j;
+  for(let i=1;i<=a.length;i++){
+    for(let j=1;j<=b.length;j++){
+      const cost=(a[i-1]===b[j-1])?0:1;
+      dp[i][j]=Math.min(dp[i-1][j]+1,dp[i][j-1]+1,dp[i-1][j-1]+cost);
+    }
+  }
+  return dp[a.length][b.length];
+}
+function damerau(a,b){
+  if(a.length!==b.length)return false;
+  for(let i=0;i<a.length-1;i++){
+    if(a[i]!==b[i]){
+      if(a[i]===b[i+1]&&a[i+1]===b[i])return true;
+      return false;
+    }
+  }
+  return false;
+}
+
+// штраф кривой подсказки (общая вспомогательная кривая)
+function hintFactor(f){
+  f = clamp01(f);
+  const curve = CFG.penalty.hintCurve || { type: "sigmoid", k: 12, x0: 0.45 };
+  if(curve.type === "sigmoid"){
+    const k  = curve.k  ?? 10, x0 = curve.x0 ?? 0.5;
+    const y  = 1 / (1 + Math.exp(-k * (f - x0)));
+    const y0 = 1 / (1 + Math.exp(-k * (0 - x0)));
+    const y1 = 1 / (1 + Math.exp(-k * (1 - x0)));
+    return (y - y0) / (y1 - y0);
+  }
+  if(curve.type === "gamma"){
+    const g = Math.max(1.01, curve.gamma || 2.2);
+    return Math.pow(f, g);
+  }
+  if(curve.type === "smoothstep"){
+    return f*f*(3 - 2*f);
+  }
+  return f;
+}
+
+let lastRec=null;
+
+function tokensSafe(arr, idx){ return (idx>=0 && idx<arr.length) ? arr[idx] : null; }
+
+function check(){
+  const target=document.getElementById("target").innerText;
+  const typed=document.getElementById("answer").value;
+
+  let tTokens=tokenize(target), uTokens=tokenize(typed);
+
+  // ⬇️ свёртка разделяемых фразалов
+  tTokens = collapseSeparableA2(tTokens);
+  uTokens = collapseSeparableA2(uTokens);
+
+  const log=[]; const push=(s)=>log.push(s);
+  const sep = (title)=>{ log.push("\n—— " + title + " ——"); };
+
+  if(!tTokens.length){
+    document.getElementById("vis").innerHTML="";
+    document.getElementById("bar").innerHTML="";
+    document.getElementById("summary").innerHTML="";
+    document.getElementById("classStats").innerHTML="";
+    document.getElementById("log").innerText="Пустой эталон: нечего сравнивать";
+    document.getElementById("rec").innerHTML='<span class="badge" style="color:#f80">Нет эталона</span>';
+    return;
+  }
+
+  // ===== Блок метрик и подсчёта =====
+  let Bsum=0,denom=0;
+  let denomA=0,EA=0,coverageSum=0;
+  let scores=[]; let classStats={A:{ok:0,near:0,bad:0},B:{ok:0,near:0,bad:0}};
+
+  // Для лога: покажем нормализованные строки и токены
+  sep("Нормализация и токены");
+  push(`Эталон (norm): "${normalize(target)}"`);
+  push(`Ввод (norm):   "${normalize(typed)}"`);
+  push(`Токены эталона (${tTokens.length}): [${tTokens.join(' | ')}]`);
+  push(`Токены ввода   (${uTokens.length}): [${uTokens.join(' | ')}]`);
+
+  sep("Помесячная классификация и совпадения");
+
+  for(let i=0;i<tTokens.length;i++){
+    const tok=tTokens[i];
+    const u=uTokens[i]||"(пусто)";
+    const cls=classifyCtx(tTokens, i);
+    const w=weight(cls);
+    denom+=w; if(cls==="A")denomA+=w;
+
+    let score=0, reason="пропуск", dist=null, tol=null, matchType="miss";
+    if(cls==="SHORT"){ if(tok===u){ score=1; matchType="exact"; reason="короткое слово совпало"; } }
+    else{
+      if(tok===u){ score=1; matchType="exact"; reason="точное совпадение"; }
+      else{
+        dist=levenshtein(tok,u); const len=tok.length; tol=(len<=4)?0:(len<=8?1:2);
+        if(dist<=tol){ score=Math.max(0,1-dist/len); matchType="fuzzy"; reason=`фаззи: dist=${dist}, допуск=${tol}`; }
+        else if(damerau(tok,u)){ score=(tok.length>=5)?0.5:0.3; matchType="damerau"; reason="перестановка соседних букв"; }
+      }
+    }
+
+    Bsum+=score*w;
+    if(cls==="A")EA+=score*w;
+    if(score>=0.5)coverageSum+=w;
+
+    if(cls==="A"||cls==="B"){
+      if(score===1) classStats[cls].ok++;
+      else if(score>=0.5) classStats[cls].near++;
+      else classStats[cls].bad++;
+    }
+
+    scores.push({idx:i,tok,u,cls,w,score,matchType,dist,tol});
+
+    push(`${String(i+1).padStart(2,'0')}. [${cls}, w=${w}] «${tok}» ↔ «${u}» → score=${score.toFixed(2)} (${reason})`);
+  }
+
+  // ===== Штрафы по компонентам =====
+  let penalties=0;
+  let pExtraRaw=0, pExtra=0, extraList=[];
+  let pOrderRaw=0, pOrder=0, orderList=[];
+  let pHint=0, hintUsed=false, hintStrong=false, hintDetails=null;
+
+  // ЛИШНИЕ СЛОВА (после конца эталона)
+  const extraTokens=uTokens.slice(tTokens.length);
+  extraTokens.forEach(tok=>{
+    const p=Math.min(CFG.penalty.extraPerWord,CFG.penalty.extraCapToken);
+    pExtraRaw+=p; extraList.push({tok, p});
+  });
+  pExtra = Math.min(pExtraRaw, denom*CFG.penalty.extraCapPhrase);
+  penalties += pExtra; // применяем после капа
+
+  // ПОРЯДОК СЛОВ (только A; не штрафуем за явную опечатку)
+  let targetA=[],userA=[];
+  scores.forEach(s=>{ if(s.cls==="A"&&s.score>0){targetA.push(s.tok);userA.push(s.u);} });
+  targetA.forEach((tok,i)=>{
+    if(userA[i] && userA[i] !== tok){
+      const dist = levenshtein(tok, userA[i]);
+      const tol = (tok.length<=4)?0 : (tok.length<=8?1:2);
+      const isTypo = dist <= tol || damerau(tok, userA[i]);
+      if(!isTypo){
+        const p=CFG.penalty.orderA*CFG.weights.A;
+        pOrderRaw+=p;
+        orderList.push({expected:tok, got:userA[i], p});
+      }
+    }
+  });
+  const capOrder=denom*CFG.penalty.orderCap;
+  pOrder = Math.min(pOrderRaw, capOrder);
+  penalties += pOrder;
+
+  // ПОДСКАЗКА (читаем след из localStorage)
+  try{
+    const info = JSON.parse(localStorage.getItem('anki_hint_info')||'null');
+    const n = tTokens.length;
+    if (info && info.total>0){
+      const fRaw = clamp01(info.revealed / info.total); // доля раскрытого
+      hintUsed = fRaw > 0;
+      const shortBoost = (n<=4) ? 1.6 : (n<=6 ? 1.3 : 1.0);
+      const base = denom * fRaw * (0.25 + 0.55*fRaw);
+      pHint = base * shortBoost;
+      if (n<=5 && fRaw>=0.8) {
+        pHint += denom * 0.25;
+        hintStrong = true;
+      } else if (fRaw>=0.6) {
+        hintStrong = true;
+      }
+      penalties += pHint;
+      hintDetails = {n, revealed:info.revealed, total:info.total, f: +(fRaw.toFixed(2)), shortBoost, base:+(base.toFixed(3)) };
+    }
+  }catch(e){}
+  try{ localStorage.removeItem('anki_hint_info'); }catch(e){}
+
+  // ===== Метрики =====
+  const E=Math.max(0,Bsum-penalties);
+  const OverallNum=(E/denom*100);
+  const Overall=OverallNum.toFixed(1);
+  const ContentNum=denomA>0?(EA/denomA*100):100;
+  const ContentUI=denomA>0?ContentNum.toFixed(1):"—";
+  const CoverageNum=(coverageSum/denom*100);
+  const Coverage=CoverageNum.toFixed(1);
+  const FinalScoreNum=(0.7*OverallNum+0.3*CoverageNum);
+  const FinalScore=FinalScoreNum.toFixed(1);
+
+  // ===== Визуализация токенов (MIS-рамка для локальной перестановки B/C) =====
+  const html=scores.map((s,i)=>{
+    const g=Math.round(s.score*255), r=255-g;
+    const col=`rgb(${r},${g},0)`;
+    let misMark="";
+    const prev=tokensSafe(tTokens,i-1), next=tokensSafe(tTokens,i+1);
+    const isLocalSwap = s.u && s.u!=="(пусто)" && ((prev && s.u===prev) || (next && s.u===next));
+    if(s.cls!=="A" && isLocalSwap) misMark=" border:2px dashed #ff0";
+    return `<span title="${s.tok} · ${s.cls} · ${s.score.toFixed(2)}" style="background:${col};${misMark}">${s.u}</span>`;
+  }).join(" ");
+  const extrasHtml=extraTokens.map(x =>
+    `<span title="EXTRA: ${x}" style="background:#555;color:#fff;border:2px solid #f44">${x}</span>`
+  ).join(" ");
+  document.getElementById("vis").innerHTML=html+(extrasHtml?(" "+extrasHtml):"");
+
+  // ===== Прогресс-бар и карточки =====
+  document.getElementById("bar").innerHTML=`<div style="height:100%;width:${Overall}%;background:#21d07a"></div>`;
+  document.getElementById("summary").innerHTML=
+    `<div>Overall: ${Overall}%</div>
+     <div>Content: ${ContentUI}${denomA>0?'%':''}</div>
+     <div>Coverage: ${Coverage}%</div>
+     <div>FinalScore: ${FinalScore}%</div>`;
+  document.getElementById("classStats").innerHTML=
+    `<div><b>A</b>: ✅${classStats.A.ok} · ⚠️${classStats.A.near} · ❌${classStats.A.bad}</div>
+     <div><b>B</b>: ✅${classStats.B.ok} · ⚠️${classStats.B.near} · ❌${classStats.B.bad}</div>`;
+
+  // ===== Подробный LOG (русский) =====
+  sep("Штрафы: лишние слова");
+  if(extraList.length===0) push("— нет");
+  else extraList.forEach(x=> push(`+${x.p.toFixed(2)} за лишнее слово «${x.tok}» (cap-на-слово ≤ ${CFG.penalty.extraCapToken})`));
+  const extraCapPhrase = denom*CFG.penalty.extraCapPhrase;
+  if(pExtraRaw>pExtra) push(`CAP по фразе: min(${pExtraRaw.toFixed(2)}, ${extraCapPhrase.toFixed(2)}) → применено ${pExtra.toFixed(2)}`);
+  push(`Итого за лишние: ${pExtra.toFixed(2)} (порог по фразе ≤ ${(extraCapPhrase).toFixed(2)})`);
+
+  sep("Штрафы: порядок слов (только класс A)");
+  if(orderList.length===0) push("— нет");
+  else orderList.forEach(o=> push(`+${o.p.toFixed(2)} за порядок: ожидалось «${o.expected}», у пользователя «${o.got}»`));
+  if(pOrderRaw>pOrder) push(`CAP по порядку: min(${pOrderRaw.toFixed(2)}, ${(capOrder).toFixed(2)}) → применено ${pOrder.toFixed(2)}`);
+  push(`Итого за порядок: ${pOrder.toFixed(2)} (cap ≤ ${(capOrder).toFixed(2)})`);
+
+  sep("Штрафы: подсказка");
+  if(!hintDetails) push("— подсказка не использовалась");
+  else {
+    push(`Параметры: n=${hintDetails.n}, раскрыто ${hintDetails.revealed}/${hintDetails.total} (f=${hintDetails.f}), base=${hintDetails.base}, boost=${hintDetails.shortBoost}`);
+    if(hintStrong) push("Сильная подсказка: ограничивает рекомендацию (см. ниже)");
+    push(`Итого за подсказку: ${pHint.toFixed(2)}`);
+  }
+
+  sep("Итоги");
+  push(`Сумма базовых баллов B = ${Bsum.toFixed(2)} из возможных Σвесов = ${denom.toFixed(2)}`);
+  push(`Штрафы: лишние=${pExtra.toFixed(2)} + порядок=${pOrder.toFixed(2)} + подсказка=${pHint.toFixed(2)} → Σштрафов = ${(pExtra+pOrder+pHint).toFixed(2)}`);
+  push(`Итоговые баллы E = max(0, B − Σштрафов) = ${E.toFixed(2)}`);
+  push(`Accuracy (Overall) = ${Overall}%`);
+  push(`Content Accuracy (A) = ${denomA>0?ContentUI+'%':'—'}`);
+  push(`Coverage = ${Coverage}%`);
+  push(`FinalScore = ${FinalScore}%`);
+
+  document.getElementById("log").innerText=log.join("\n");
+
+  // ===== Рекомендация (учёт подсказок и гистерезис) =====
+  const rec=classifyResult(OverallNum,ContentNum,CoverageNum,FinalScoreNum, { usedHint: !!hintDetails, strong: hintStrong, nTokens: tTokens.length });
+  lastRec=rec;
+  const color=rec.startsWith("Again")?"#f44":(rec.startsWith("Hard")?"#f80":(rec.startsWith("Good")?"#2bdc63":"#43a0ff"));
+  document.getElementById("rec").innerHTML=`<span class=\"badge\" style=\"color:${color}\">Рекомендация: ${rec}</span>`;
+}
+
+// === ОБНОВЛЁННАЯ функция рекомендаций (учитывает подсказки) ===
+function classifyResult(OverallNum,ContentNum,CoverageNum,FinalScoreNum, opts={}){
+  const usedHint = !!opts.usedHint;
+  const strong   = !!opts.strong;
+  const nTokens  = opts.nTokens || 999;
+
+  // Базовые отсечки
+  if(ContentNum<70) return "Again (Content<70%)";
+  if(CoverageNum<60) return "Again (Coverage<60%)";
+
+  // Сильная подсказка + короткое → не даём Easy/Good
+  if (strong && nTokens<=5) {
+    if (OverallNum>=90) return "Hard (hint)";
+    return "Again (hint)";
+  }
+
+  // Базовая шкала
+  let rec;
+  if(OverallNum>=99) rec="Easy";
+  else if(OverallNum>=90) rec="Good";
+  else if(OverallNum>=70) rec="Hard";
+  else rec="Again";
+
+  // Если была подсказка — «Easy» не выдаём; при сильной подсказке «Good» → «Hard»
+  if (usedHint) {
+    if (rec==="Easy") rec="Good";
+    if (strong && rec==="Good") rec="Hard";
+  }
+
+  // Гистерезис
+  if(rec==="Hard" && lastRec==="Again" && FinalScoreNum<CFG.hysteresis.again) rec="Again";
+  if(rec==="Again" && lastRec==="Hard" && FinalScoreNum>=CFG.hysteresis.hard) rec="Hard";
+
+  return rec;
+}
+
+// авто-подстановка ответа и отложенный запуск (ждём статический блок)
+(function initFromFront(){
+  try{
+    const val=localStorage.getItem('anki_tmp_answer')||"";
+    const $hidden=document.getElementById('answer');
+    if($hidden) $hidden.value=val;
+    localStorage.removeItem('anki_tmp_answer');
+  }catch(e){}
+  // ДВА кадра, чтобы успел выполниться статический блок ниже
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    if ((window.PHRASES_A2.size+window.PHRASES_A3.size)===0){
+      console.warn('[phrasals] нет статического блока с наборами — фразалы не будут учитываться');
+    }
+    check();
+  }));
+})();
+</script>
+
+<!-- ====== PHRASEDATA (curated) ====== -->
+<script>
+// Короткие, вручную отобранные списки фразалов
+
+// A2 (контактные 2-словные)
+const PHRASES_A2_STATIC = new Set([
+  "ask_out","back_up","blow_up","break_down","break_up","bring_back","bring_up",
+  "call_back","call_off","carry_on","carry_out","check_in","check_out","cheer_up","clean_up","clear_up",
+  "come_back","come_in","come_on","come_over","cut_back","cut_down","cut_off",
+  "depend_on","figure_out","fill_in","fill_out","find_out","get_back","get_in","get_off","get_on","get_out","get_over","get_through","get_up",
+  "give_in","give_up","go_back","go_in","go_off","go_on","go_out","go_over","grow_up",
+  "hand_in","hand_out","hand_back","hang_on","hold_on","keep_on","keep_up","knock_out",
+  "lay_off","leave_out","let_down","log_in","log_out","look_after","look_for","look_into","look_out","look_over","look_up",
+  "make_up","pass_away","pick_up","point_out","print_out","pull_over","put_away","put_down","put_off","put_on","put_out","put_up",
+  "run_into","run_out","run_over","set_up","shut_down","sit_down","slow_down","sort_out",
+  "speak_up","speed_up","split_up","switch_off","switch_on","take_away","take_back","take_down","take_off","take_on","take_out","take_over","take_up",
+  "throw_away","throw_out","try_on","try_out","turn_down","turn_off","turn_on","turn_up",
+  "wake_up","warm_up","wash_up","wear_out","work_out","write_down","write_up","write_off","jot_down","mark_down","mark_up"
+]);
+
+// A3 (контактные 3-словные)
+const PHRASES_A3_STATIC = new Set([
+  "look_forward_to","run_out_of","get_rid_of","put_up_with","come_up_with",
+  "catch_up_with","keep_up_with","keep_away_from",
+  "look_out_for","look_down_on","look_up_to",
+  "get_away_with","get_back_to","get_back_at","get_through_to",
+  "go_back_to","go_on_about","go_over_to","face_up_to","come_down_with","go_in_for","look_in_on",
+  "talk_back_to","talk_down_to","turn_away_from","walk_away_from","warm_up_to",
+  "zero_in_on","zoom_in_on","make_up_for","take_over_from","work_up_to","stick_up_for","stand_up_for","stand_up_to",
+  "read_up_on","check_in_with","sign_up_for","set_out_to","come_up_against"
+]);
+
+// A2 (разделяемые — укороченный белый список)
+const SEPARABLE_A2_STATIC = new Set([
+  "turn_off","turn_on","turn_up","turn_down",
+  "switch_on","switch_off","switch_over",
+
+  "put_on","put_off","put_out","put_away","put_down","put_up","put_back","put_together","put_through",
+
+  "take_off","take_on","take_out","take_up","take_down","take_back","take_apart","take_over",
+
+  "bring_up","bring_back","bring_out","bring_down",
+
+  "set_up","set_back","set_down","set_off","set_out",
+
+  "give_back","give_up","hand_in","hand_out","hand_back","hand_over",
+
+  "pass_on","pass_up","pass_off",
+
+  "pick_up","pick_out","point_out",
+
+  "write_down","write_up","write_off","jot_down","mark_down","mark_up",
+
+  "call_off","call_back","carry_out","clear_up","clean_up","cheer_up",
+
+  "fill_in","fill_out","figure_out","find_out","look_over","look_up","print_out",
+
+  "try_on","try_out","throw_away","throw_out","shut_down","slow_down","sort_out",
+
+  "wake_up","warm_up","wash_up","wear_out","work_out","pay_back","hold_back","hold_off","hold_up",
+  "knock_down","knock_out","lay_off","let_down","make_up"
+]);
+
+(function mergePhrasalsStatic(){
+  if(!window.PHRASES_A2)   window.PHRASES_A2   = new Set();
+  if(!window.PHRASES_A3)   window.PHRASES_A3   = new Set();
+  if(!window.SEPARABLE_A2) window.SEPARABLE_A2 = new Set();
+
+  // дополнительная страховка от мусора
+  const VERB_HEADS = new Set([
+    'ask','back','blow','break','bring','call','carry','check','cheer','clean','clear','come','cut','depend',
+    'figure','fill','find','get','give','go','grow','hand','hang','hold','keep','knock','lay','leave','let','log',
+    'look','make','mark','jot','pass','pick','point','print','pull','put','run','set','shut','sit','slow','sort',
+    'speak','speed','split','switch','take','throw','try','turn','wake','warm','wash','wear','work','pay','stick',
+    'stand','read','sign','set','zero','zoom'
+  ]);
+  const ok = k => VERB_HEADS.has(k.split('_')[0]);
+
+  [...PHRASES_A2_STATIC].filter(ok).forEach(k => window.PHRASES_A2.add(k));
+  [...PHRASES_A3_STATIC].filter(ok).forEach(k => window.PHRASES_A3.add(k));
+  [...SEPARABLE_A2_STATIC].filter(ok).forEach(k => window.SEPARABLE_A2.add(k));
+
+  console.info(`[phrasals-static] loaded: A2=${window.PHRASES_A2.size}, A3=${window.PHRASES_A3.size}, separable=${window.SEPARABLE_A2.size}`);
+})();
+</script>
+<!-- ====== /PHRASEDATA ====== -->
